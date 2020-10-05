@@ -1,0 +1,422 @@
+---
+title: 'Bayesian meta-analysis for pharmacokinetic parameters'
+subtitle: "ACoP11 Conference"
+author: "Witold Więcek"
+date: "November 2020"
+output: 
+  beamer_presentation:
+    includes:
+      in_header: certarastyle.tex
+bibliography: bibliography/zotero_jan2019.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      # fig.retina=4, 
+                      comment = "")
+library(knitr)
+library(dplyr)
+library(ggplot2)
+library(baggr)
+library(broom)
+library(scales)
+library(broom.mixed)
+source("data_preparation_2d6_methods.R")
+theme_set(theme_minimal(base_size = 18))
+
+
+model_inputs_2d6 <- data_2d6 %>% 
+  # group_by(domain, parameter, ethnicity) %>%
+  mutate(polymorphism = factor(polymorphism, levels = c("PM", "IM", "EM"))) %>% #PM<IM<EM!!!
+  rename(ss = sample.size) %>%
+  mutate(lgm = log(gm), lv = (log(gsd))^2) %>% 
+  # mutate(lgm = ifelse(parameter == "CL", -lgm, lgm)) %>% #CL ---> 1/CL
+  select(-gm, -gsd) %>%
+  filter(!(polymorphism == "PM" & ethnicity == "A")) %>%
+  filter(parameter == "CL") %>%
+  # filter(parameter != "Cmax") %>%
+  #drop a few smaller drugs
+  group_by(drug) %>% mutate(ndrug = n()) %>% ungroup() %>%
+  filter(ndrug > 2) %>% 
+  filter(!(drug %in% c("r-propafenone", "s-propafenone", "s-metoprolol"))) %>%
+  filter(ethnicity == "C") %>%
+  # filter(drug %in% data_2d6_fm_gibbs$drug) %>%
+  mutate(drug = droplevels(drug)) 
+# mutate(parameter = factor(ifelse(parameter == "Cmax", "Cmax", "AUC or 1/CL")))
+
+data_2d6_fm_gibbs_filtered <- filter(data_2d6_fm_gibbs, drug %in% model_inputs_2d6$drug)
+
+stan_input <- with(model_inputs_2d6, 
+                   list("ss"=ss, "lgm"=lgm, "lv"=lv, 
+                        "drug_eth_par"     = as.numeric(droplevels(interaction(drug, parameter, ethnicity))), 
+                        "drug"             = as.numeric(droplevels(drug)), 
+                        "polymorphism"     = as.numeric(polymorphism),
+                        # "ethnicity"        = as.numeric(ethnicity),
+                        "ethnicity"        = rep(1, length(ethnicity)),
+                        "parameter"        = as.numeric(droplevels(parameter)),
+                        "study"            = as.numeric(droplevels(interaction(study, parameter, ethnicity))),
+                        "n"                = nrow(model_inputs_2d6), 
+                        "n_train"          = nrow(model_inputs_2d6), 
+                        "n_drugs"          = length(unique(drug)),
+                        "n_drugs_eth_par"  = length(unique(interaction(drug, parameter, ethnicity))),
+                        "n_polymorphisms"  = length(unique(polymorphism)),
+                        "n_parameters"     = 1,
+                        "n_ethnicities"    = 1,
+                        "n_studies"        = length(unique(interaction(study, parameter, ethnicity))),
+                        "n_fm_observations"= sum(data_2d6_fm_gibbs$drug %in% drug),
+                        "fm_observed"      = data_2d6_fm_gibbs_filtered[, "fm"],
+                        "fm_sigma"         = data_2d6_fm_gibbs_filtered[, "sigma_fm"],
+                        "fm_observed_drug" = as.numeric(factor(data_2d6_fm_gibbs_filtered$drug, 
+                                                               levels = levels(drug)))
+                   ))
+
+labels <- with(model_inputs_2d6, 
+               list("polymorphism" = levels(droplevels(polymorphism)), 
+                    "parameter"    = levels(droplevels(parameter)),
+                    "drug"         = levels(droplevels(drug))))
+
+paper_result  <- readRDS("output_2d6_methods/paper_result.rds")
+
+estimated_fm <- data.frame(
+  drug = labels$drug,
+  tidyMCMC(paper_result, "fm", conf.int = TRUE))
+```
+
+
+# 
+
+Work funded by a grant from European Food Safety Authority and Certara. Special thanks to Dr Jean-Lou Dorne (EFSA), Dr Nadia Quignot (Certara) and Dr Billy Amzal (Certara).
+
+
+
+# Introduction
+
+__Objective__: characterise inter-group differences in PK parameters (AUC, clearance, Cmax) using summary-level PK data only from many drugs
+
+__Use case__: deriving uncertainty factors (UFs) for chemical risk assessment
+
+  + Original motivation for UFs: where compound-specific data not available, default values must be used to extrapolate
+  + The model applicable in any context where we extrapolate PK across different subgroups
+  + Especially useful when comparing more than means only
+
+
+
+# Real-world example
+
+UFs for PK parameters due to polymorphic metabolism for CYP2D6 enzyme. 
+
+* Compare poor metabolisers, PM, vs extensive metabolisers, EM.
+* Data based on pre-existing literature review. 81 studies of 9 drugs.
+
+Issues:
+
+1. True variances are unknown (small samples)
+2. Both means and variances may be impacted 
+3. Ratios of PK parameters vary across studies
+4. Want to incorporate prior information
+
+
+
+
+
+# Data: geometric means
+
+Means (logged) for clearance in a subset containing 81 study arms, 9 drugs metabolised by CYP2D6.
+
+
+```{r, echo = FALSE, height = 4}
+model_inputs_2d6 %>% ggplot(aes(y = lgm, x = drug, color = polymorphism)) + geom_jitter(width = .2) + coord_flip() + ylab("mu") + xlab("") + scale_color_manual(values = c("PM" = "red", "EM" = "blue", "IM" = "green"))
+```
+
+
+
+# Small sample sizes
+
+```{r, warning=FALSE, echo=FALSE}
+data_2d6 %>%
+  ggplot(aes(sample.size)) + geom_histogram(binwidth = .5, color = "black") + 
+  xlim(0, 40) + xlab("Sample size") 
+```
+
+
+
+# Variable (geometric mean) ratios of EM to PM 
+
+
+```{r}
+filter(data_2d6_ratios, parameter == "CL", 
+       ethnicity == "C", !is.na(pm_em), drug %in% labels$drug) %>%
+  mutate(em_pm = log(1/pm_em)) %>%
+  ggplot(aes(x = drug, y = em_pm)) + 
+  geom_point(color = "red", size = 2) +
+  coord_flip() +
+  labs(y = "log EM/PM ratio of geometric means", x = "")
+```
+
+
+
+# Variances depend on subgroup
+
+```{r}
+model_inputs_2d6 %>% ggplot(aes(x = polymorphism, color = polymorphism, y = lv)) + geom_jitter(size = 3) + ylab("sigma^2") + scale_color_manual(values = c("PM" = "red", "EM" = "blue", "IM" = "green"))
+```
+
+
+
+
+# Generic Bayesian model
+
+We model both the true means and true SDs: $\mu_i$'s and $\sigma_i$'s.
+
+For observation $i$ with sample mean and variance (on log scale) $lgm$ and $lv$ and sample size $n$;
+
+
+$$
+\begin{aligned}
+lgm_i & \sim \mathcal{N}(\mu_i, \dfrac{\sigma_i}{\sqrt{n_i}}) \\
+lv_i  & \sim \Gamma(\frac{n_i-1}{2}, \frac{n_i-1}{2\sigma_i^2})
+\end{aligned}
+$$
+
+$c(i)$, compound (drug), $s(i)$, study, $g(i)$, group (polymorphism)
+
+$$\begin{aligned}
+\mu_i &= \mu^c_{c(i)} + \mu^s_{s(i)} + log(R_i), \\
+log(\sigma_i) &= \gamma^c_{c(i)} +\gamma_{g(i)}.
+\end{aligned}$$
+
+
+
+-----
+
+```{r, echo = FALSE}
+include_graphics("model_schematic_both.PNG")
+```
+
+For model of polymorphisms we use $R_{i} = EF_{i}\cdot fm_{d(i)}+1-fm_{d(i)}$ with informative priors on fraction metabolised $fm$.
+
+
+
+
+```{r, warning=FALSE, echo=FALSE, cache = TRUE}
+#Warning will be due to the geom_density
+
+im_mean <- rstan::extract(paper_result, "mean_ef")[[1]][,1,1,1]
+ef_pm <- c(sapply(rstan::extract(paper_result, "sigma_ef")[[1]], function(x) rnorm(100, 0, x)))
+ef_em <- c(sapply(rstan::extract(paper_result, "sigma_ef")[[1]], function(x) rnorm(100, 1, x)))
+ef_im <- c(apply(cbind(im_mean, rstan::extract(paper_result, "sigma_ef")[[1]]), 1,
+               function(x) rnorm(10, x[1], x[2])))
+# "theoretical" EFs plot:
+fig3a <- rbind(
+  data.frame(polymorphism = "PM", ef = ef_pm),
+  data.frame(polymorphism = "EM", ef = ef_em),
+  data.frame(polymorphism = "IM", ef = ef_im)
+  ) %>%
+  # filter(ef <= 1, ef >= 0) %>%
+  ggplot(aes(ef, group = polymorphism, fill = polymorphism)) + 
+  geom_density(alpha = .5) +
+  coord_cartesian(x = c(0,1), expand = F) +
+  scale_y_continuous(name = NULL, breaks = NULL) +
+  scale_x_continuous(name = "enzyme function", breaks = c(0, .5, 1)) +
+  scale_fill_discrete(name = "") + 
+  theme(plot.margin=unit(c(1,1,1,1),"cm"))
+
+fm <- rstan::extract(paper_result, "fm")[[1]] 
+fig3b <- apply((fm * sample(ef_pm[ef_pm > 0], 2000)) + 1 - fm, 2, 
+  function(x) c(quantile(x, 0.025), quantile(x, 0.1), mean(x), quantile(x, 0.9), quantile(x, .975))) %>%
+  t() %>%
+  data.frame() %>%
+  setNames(c("lci025", "lci", "ratio", "uci", "uci975")) %>%
+  mutate(drug = labels$drug) %>%
+  mutate(drug = factor(drug, levels = drug[order(ratio)])) %>%
+  ggplot(aes(x = drug, y = ratio)) + 
+  geom_point(size = 3) + 
+  geom_errorbar(aes(ymin = lci, ymax = uci), lwd = 1.2, width = 0) + 
+  geom_errorbar(aes(ymin = lci025, ymax = uci975), width = 0) + 
+  geom_jitter(data = filter(data_2d6_ratios, parameter == "CL", 
+                           ethnicity == "C", !is.na(pm_em), drug %in% labels$drug), 
+             aes(x = drug, y = pm_em), color = "red", size = 2, width = .2) +
+  coord_flip() +
+  labs(y = "PM/EM ratio in CL", x = "")
+
+m <- rstan::extract(paper_result, "fm")[[1]]
+colnames(m) <- labels$drug
+estimated_fm <- tidyr::gather(as.data.frame(m), drug, fm) %>%
+  mutate(dist = "posterior")
+for(i in 1:nrow(data_2d6_fm_gibbs_filtered))
+  estimated_fm <- rbind(estimated_fm, data.frame(
+  fm = rnorm(10000, data_2d6_fm_gibbs_filtered$fm[i], data_2d6_fm_gibbs_filtered$sigma_fm[i]),
+  drug = data_2d6_fm_gibbs_filtered$drug[i],
+  dist = "prior"))
+
+fig3c <- estimated_fm %>%
+  filter(drug %in% c("metoprolol", "desipramine", "imipramine", "mexiletine", "venlafaxine", "tolterodine")) %>%
+  # mutate(drug = paste0(substr(drug, 1, 7), ".")) %>%
+  ggplot(aes(fm, group = dist, fill = dist)) + geom_density(alpha=.5) + 
+  facet_wrap(~ drug, ncol = 3) + 
+  scale_x_continuous(labels = percent, limits = c(0,1)) +
+  scale_y_continuous(name = NULL, breaks = NULL) +
+  scale_fill_manual(name = "Distribution", values = c("posterior" = "red", "prior" = "skyblue")) +
+  theme(legend.position = "bottom")
+
+# gridExtra::grid.arrange(grobs = list(fig3a, fig3c, fig3b), 
+#                         layout_matrix = matrix(c(1,2,3,3),2,2), 
+#                         widths = c(.5, .5), heights = c(.3, .7))
+```
+
+
+
+# Comparing prior to posterior: fraction metabolised
+
+```{r, echo=FALSE, warning=FALSE, fig.height=5, fig.width=7}
+fig3c
+```
+
+
+
+# Bayesian posterior: distribution of clearance
+
+```{r}
+
+sigma_drug <- rstan::extract(paper_result, "log_sigma_drug")[[1]]
+sigma_poly_em <- rstan::extract(paper_result, "sigma_logeffect_poly")[[1]][,3,1,1]
+sigma_pm   <- exp(sigma_drug) #9 columns - 1 per drug
+sigma_em   <- exp(sigma_drug + sigma_poly_em) #9 cols
+
+fm <- rstan::extract(paper_result, "fm")[[1]] #9 cols
+sigma_ef <- rstan::extract(paper_result, "sigma_ef")[[1]]
+ef_pm <- c(sapply(sigma_ef, function(x) abs(rnorm(1, 0, x)))) #draws of EF for PMs
+gm_ratio <- fm * ef_pm + 1 - fm
+
+mu_drug <- rstan::extract(paper_result, "mu_drug")[[1]]
+
+# REF vs PM values:
+em_min <- pm_min <- em_median <- sigma_em*0
+for(i in 1:nrow(sigma_em)) {
+  for(j in 1:ncol(sigma_em)) {
+    # We use 10 as baseline as it's meaningless in case of log-normals!
+    em_median[i,j]  <- qlnorm(.5, mu_drug[i,j], sigma_em[i,j])
+    em_min[i,j]  <- qlnorm(.05, mu_drug[i,j], sigma_em[i,j])
+    pm_min[i,j]  <- qlnorm(.05, mu_drug[i,j] + log(gm_ratio[i,j]), sigma_pm[i,j])
+  }
+}
+
+# UF values:
+uf <- sigma_em*0
+for(i in 1:nrow(sigma_em)) {
+  for(j in 1:ncol(sigma_em)) {
+    uf[i,j] <- (em_median[i,j])/min((c(em_min[i,j], pm_min[i,j])))
+    uf[i,j] <- (em_median[i,j])/pm_min[i,j]
+  }
+}
+
+# drugs <- c("desipramine",  "fesoterodine", "imipramine",   "metoprolol",   
+#            "mexiletine",   "mirtazapine", "propafenone",  "tolterodine",  
+#            "venlafaxine")
+drugs <- labels$drug
+mean_uf <- apply(uf, 2, mean)
+lci_uf <- apply(uf, 2, quantile, .1)
+uci_uf <- apply(uf, 2, quantile, .9)
+
+mean_uf_df <- data.frame(drugs, mean_uf)
+```
+
+
+```{r distributions of polymorphisms, warning = FALSE,  fig.width = 6, fig.height = 4}
+# Compare distributions:
+em <- pm <- matrix(0, 20000, 9)
+for(i in 1:9){
+  em[,i]  <- rlnorm(20000, apply(mu_drug, 2, mean)[i], apply(sigma_em, 2,mean)[i])
+  pm[,i]  <- rlnorm(20000, apply(mu_drug, 2, mean)[i] + log(apply(gm_ratio, 2, mean))[i], 
+                   apply(sigma_pm, 2, mean)[i])
+}
+
+df <- rbind(
+  mutate(as.data.frame(log(em)), group="EM"),
+  mutate(as.data.frame(log(pm)), group="PM")) %>%
+  setNames(c(drugs, "groups"))
+
+tidyr::gather(df, compound, value, -groups) %>%
+  filter(compound != "mirtazapine ") %>%
+  ggplot(aes(value, group=groups, fill =groups)) + 
+  geom_density(alpha = .5) + 
+  facet_wrap(compound ~ ., ncol = 4, scales = "free_y") +
+  theme_minimal() +
+  theme(legend.position = "bottom", axis.text.y = element_blank()) +
+  ylab("density") + xlab("clearance (log scale)") +
+  scale_fill_viridis_d(name = "Polymorphism")
+  # scale_fill_manual(name = "Polymorphism", values = c("PM" = "red", "EM" = "skyblue"))
+```
+
+
+
+
+# Ratios: Bayesian posteriors (black) vs data (red) {data-background=#ffffff}
+
+```{r, echo=FALSE, warning=FALSE}
+fig3b
+```
+
+
+# Result: UFs depending on both variance and means
+
+
+```{r, fig.width = 9, fig.height = 6}
+par(oma = rep(0,4), mar = rep(1.5,4))
+cv <- seq(.05, .95, .1)
+sd <- log(cv + 1)
+ratios <- seq(1, 10, 1)
+uf <- matrix(0, length(sd), length(ratios))
+for(i in 1:length(sd))
+  for(j in 1:length(ratios))
+    uf[i,j] <- exp(qnorm(.95, 0 + log(ratios[j]), sd[i]) - qnorm(.5, 0, sd[i]))
+# https://stat.ethz.ch/pipermail/r-help/2004-August/056553.html
+pmat <- persp(z = uf, x = cv, y = ratios,
+              phi = 15, theta = 35,
+              xlab = "CV", ylab = "EM/PM ratio", zlab = "UF 95%", ticktype = "detailed",
+              oma = rep(0,4))
+trans3d <- function(x,y,z, pmat) {
+  tr <- cbind(x,y,z,1) %*% pmat
+  list(x = tr[,1]/tr[,4], y= tr[,2]/tr[,4])
+}
+mean_cv <- exp(apply(sigma_pm, 2, mean)) - 1
+mean_cv[6] <- 100 #remove mirtazapine from this plot
+points(trans3d(mean_cv,
+               1/ apply(gm_ratio, 2, mean),
+               mean_uf,
+               pmat),
+       col = "red",
+       cex = 1.2,
+       pch = 19)
+# text(trans3d((mean_cv + .075),
+text(trans3d((mean_cv + .125),
+             (1/ apply(gm_ratio, 2, mean) + 1),
+             mean_uf,
+             pmat),
+     toupper(substr(drugs,1,3)),
+     # as.character(1:9),
+     cex = 1.2,
+     pos = c(2, 1, 2, 2, 2, 2, 2, 2, 2, 2),
+     col = "red")
+```
+
+
+
+# Why did we use Bayesian methods?
+
+* Allowed us to use informative priors
+    + In our case extra data on fraction metabolised $fm$
+* Well-suited to inference on hierarchical models
+* We could use it to generalise predictions on different levels
+    + e.g. a new population for a known drug, a hypothetical drug
+* Easy to implement the model (incl. model for $\sigma$) in MCMC
+
+
+
+#
+
+Thank you!
+
+Generic code and more info: `wwiecek.github.io/`, including references to publications
+
+Contact: `witold.wiecek@certara.com`
